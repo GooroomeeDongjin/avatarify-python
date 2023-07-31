@@ -47,6 +47,7 @@ LANDMARK_SLICE_ARRAY = np.array([17, 22, 27, 31, 36, 42, 48, 60])
 
 IMAGE_SIZE = 256
 
+
 @dataclass
 class SessionData:
     overlayId: str = None,
@@ -58,6 +59,7 @@ class SessionData:
     accessKey: str = None,
     sourceList: List[str] = None,
     channelList: List[Channel] = None
+
 
 @dataclass
 class PeerData:
@@ -346,7 +348,7 @@ class VideoRecvWorker(GrmParentThread):
 
 
 class GrmCommWorker(GrmParentThread):
-    def __init__(self, p_predictor, p_send_grm_queue, p_recv_grm_queue):
+    def __init__(self, p_predictor, p_send_grm_queue, p_recv_grm_queue, p_send_audio_queue, p_recv_audio_queue):
         super().__init__()
         self.predictor = p_predictor
         self.comm_bin = None
@@ -357,6 +359,8 @@ class GrmCommWorker(GrmParentThread):
         self.sent_key_frame = False
         self.comm_send_grm_queue: deque = p_send_grm_queue
         self.comm_recv_grm_queue: GRMQueue = p_recv_grm_queue
+        self.comm_send_audio_queue: deque = p_send_grm_queue
+        self.comm_recv_audio_queue: deque = p_send_grm_queue
         self.avatar = None
         self.kp_source = None
         self.avatar_kp = None
@@ -619,7 +623,7 @@ class WebcamWorker(GrmParentThread):
 
 
 class MainWindowClass(QMainWindow, form_class):
-    def __init__(self, audio_queue):
+    def __init__(self):
         super().__init__()
         self.setupUi(self)
         self.join_session: SessionData = SessionData()
@@ -627,6 +631,9 @@ class MainWindowClass(QMainWindow, form_class):
 
         self.camera_device_init(3)
         self.audio_device_init()
+
+        self.recv_audio_queue = deque()
+        self.send_audio_queue = deque()
 
         predictor_args = {
             'config_path': opt.config,
@@ -660,7 +667,6 @@ class MainWindowClass(QMainWindow, form_class):
         self.comboBox_mic.currentIndexChanged.connect(self.change_mic_device)
         self.comboBox_audio_device.currentIndexChanged.connect(self.change_audio_device)
         self.comboBox_video_device.currentIndexChanged.connect(self.change_camera_device)
-        self.audio_queue = audio_queue
 
         self.recv_grm_queue = GRMQueue()
         self.send_grm_queue = deque()
@@ -668,7 +674,8 @@ class MainWindowClass(QMainWindow, form_class):
         self.button_change_avatar.clicked.connect(self.worker_video_recv.change_avatar_func)
         self.worker_video_recv.start_process()
 
-        self.work_grm_comm = GrmCommWorker(self.predictor, self.send_grm_queue, self.recv_grm_queue)
+        self.work_grm_comm = GrmCommWorker(self.predictor, self.send_grm_queue, self.recv_grm_queue,
+                                           self.send_audio_queue, self.recv_audio_queue)
         self.work_grm_comm.start_process()
 
         self.worker_webcam = WebcamWorker(self.preview, self.send_grm_queue, self.predictor,
@@ -676,9 +683,9 @@ class MainWindowClass(QMainWindow, form_class):
         self.button_send_keyframe.clicked.connect(self.worker_webcam.send_key_frame)
         self.worker_webcam.start_process()
 
-        self.worker_mic = MicWorker(self.audio_queue)
+        self.worker_mic = MicWorker(self.send_audio_queue)
         time.sleep(1)
-        self.worker_speaker = SpeakerWorker(self.audio_queue)
+        self.worker_speaker = SpeakerWorker(self.recv_audio_queue)
 
         self.button_chat_send.setDisabled(True)
         self.lineEdit_input_chat.setDisabled(True)
@@ -1150,9 +1157,8 @@ if __name__ == '__main__':
     global_comm_grm_type = True
 
     lock_audio_queue = threading.Lock()
-    audio_queue = deque()
 
-    myWindow = MainWindowClass(audio_queue)
+    myWindow = MainWindowClass(send_audio_queue)
     room_create_ui = RoomCreateClass()
     join_ui = RoomJoinClass()
     room_information_ui = RoomInformationClass()

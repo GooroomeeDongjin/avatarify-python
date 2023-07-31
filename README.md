@@ -10,7 +10,7 @@ Future progress (as of 2023.07.31)
 - Audio module processing (scheduled to implement only sound output function until 8/22, synchronization with video, etc. will be processed later)
 - Payload module processing of transmitted and received packets (previously implemented, then rolled back, this part will be applied from 2023/08/22 until the end of the year)
 - Application of SNNM mode (Details of application period and contents will be confirmed after additional review)
-- Applied when Jamie SDK module is completed (scheduled to be applied by the end of 2023)
+- Applied when JayB SDK module is completed (scheduled to be applied by the end of 2023)
 
 Build Configuration
   * Environment variable

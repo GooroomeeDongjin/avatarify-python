@@ -126,9 +126,11 @@ class Request(metaclass=ABCMeta):
     def mandatoryCheck(self) -> bool:
         pass
 
+
 @dataclass
 class Response(metaclass=ABCMeta):
     code: ResponseCode = None
+
 
 @dataclass
 class Channel:
@@ -142,6 +144,7 @@ class Channel:
         
         return True
 
+
 @dataclass
 class Overlay:
     overlayId: str = None
@@ -150,9 +153,11 @@ class Overlay:
     ownerId: str = None
     closed: OverlayClosed = OverlayClosed.Open
 
+
 @dataclass
 class QueryResponse(Response):
     overlay: List[Overlay] = None
+
 
 @dataclass
 class ChannelServiceControl(Channel):
@@ -167,6 +172,7 @@ class ChannelServiceControl(Channel):
             return False
             
         return True
+
 
 @dataclass
 class ChannelFeatureBasedVideo(Channel):
@@ -226,6 +232,7 @@ class ChannelFeatureBasedVideo(Channel):
                 return False
         
         return True
+
 
 @dataclass
 class ChannelAudio(Channel):

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-import multiprocessing
+
 from sys import platform as _platform
 import glob
+
+import pygame
+import pygame.camera
 
 import peerApi.classes
 from afy.videocaptureasync import VideoCaptureAsync
@@ -15,10 +18,11 @@ import cv2
 import numpy as np
 import pyaudio
 from PyQt5 import QtGui, uic
-from PyQt5.QtWidgets import QApplication, QFileDialog, QDialog, QMainWindow
+from PyQt5.QtWidgets import QApplication, QFileDialog, QDialog, QMainWindow, QWidget
 from PyQt5.QtCore import *
 from PyQt5 import QtCore
 # from collections import deque
+from multiprocessing import Process
 
 from gooroomee.bin_comm import BINComm
 from gooroomee.grm_packet import BINWrapper
@@ -34,7 +38,7 @@ import time
 RATE = 44100
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
-SPK_CHUNK = 2**12
+SPK_CHUNK = 2**14
 MIC_CHUNK = 2**14
 
 log = Tee('./var/log/cam_gooroomee.log')
@@ -44,6 +48,16 @@ form_class = uic.loadUiType("GUI/MAIN_WINDOW.ui")[0]
 LANDMARK_SLICE_ARRAY = np.array([17, 22, 27, 31, 36, 42, 48, 60])
 
 IMAGE_SIZE = 256
+
+worker_video_recv = None
+worker_video_view = None
+worker_video = None
+worker_webcam = None
+worker_video_preview = None
+worker_mic = None
+worker_speaker = None
+worker_grm_comm = None
+global_comm_grm_type = True
 
 
 @dataclass
@@ -98,30 +112,8 @@ if _platform == 'darwin':
         exit()
 
 
-'''
 def current_milli_time():
     return round(time.time() * 1000)
-'''
-
-
-def load_images(image_size=IMAGE_SIZE):
-    avatars = []
-    filenames = []
-    images_list = sorted(glob.glob(f'{opt.avatars}/*'))
-    for i, f in enumerate(images_list):
-        if f.endswith('.jpg') or f.endswith('.jpeg') or f.endswith('.png'):
-            img = cv2.imread(f)
-            if img is None:
-                log("Failed to open image: {}".format(f))
-                continue
-
-            if img.ndim == 2:
-                img = np.tile(img[..., None], [1, 1, 3])
-            img = img[..., :3][..., ::-1]
-            img = resize(img, (image_size, image_size))
-            avatars.append(img)
-            filenames.append(f)
-    return avatars, filenames
 
 
 def draw_rect(img, rw=0.6, rh=0.8, color=(255, 0, 0), thickness=2):
@@ -133,186 +125,241 @@ def draw_rect(img, rw=0.6, rh=0.8, color=(255, 0, 0), thickness=2):
     cv2.rectangle(img, (int(ll), int(u)), (int(r), int(d)), color, thickness)
 
 
-def mic_process_worker(send_grm_queue, mic_index, comm_grm_type):
+class MicWorker(GrmParentThread):
+    def __init__(self, p_send_grm_queue):
+        super().__init__()
+        self.mic_stream = None
+        self.polled_count = 0
+        self.work_done = 0
+        self.receive_data = 0
+        self.send_grm_queue: GRMQueue = p_send_grm_queue
+        self.mic_interface = 0
+        self.join_flag: bool = False
+        self.connect_flag: bool = False
+        self.grm_packet = BINWrapper()
+        # self.device_index = 2
 
-    grm_packet = BINWrapper()
-    mic_interface = pyaudio.PyAudio()
-    print(f"Mic Open, Mic Index:{mic_index}")
-    mic_stream = mic_interface.open(format=pyaudio.paInt16, channels=1, rate=44100, input=True,
-                                    input_device_index=mic_index, frames_per_buffer=MIC_CHUNK)
-    if mic_stream is None:
-        return
+    def set_join(self, p_join_flag: bool):
+        self.join_flag = p_join_flag
+        print(f"MicWorker join:{self.join_flag}")
 
-    print(f"Mic End, Mic Index:{mic_index} mic_stream:{mic_stream}")
+    def set_connect(self, p_connect_flag: bool):
+        self.connect_flag = p_connect_flag
+        print(f"MicWorker connect:{self.connect_flag}")
 
-    while mic_stream is not None:
-        # print(f"Mic read...................Index:{mic_index} mic_stream:{mic_stream}")
-        _frames = mic_stream.read(SPK_CHUNK, exception_on_overflow=False)
+    def run(self):
+        while True:
+            while self.running:
+                self.mic_interface = pyaudio.PyAudio()
+                print(f"Mic Open, Mic Index:{self.device_index}")
+                self.mic_stream = self.mic_interface.open(format=pyaudio.paInt16, channels=1, rate=44100, input=True,
+                                                          input_device_index=self.device_index,
+                                                          frames_per_buffer=MIC_CHUNK)
+                if self.mic_stream is None:
+                    continue
+                print(f"Mic End, Mic Index:{self.device_index} mic_stream:{self.mic_stream}")
 
-        if comm_grm_type is True:
-            bin_data = grm_packet.to_bin_audio_data(_frames)
-            print(f"mic_process_worker queue name:{send_grm_queue.name} size:{send_grm_queue.length()}")
-            send_grm_queue.put(bin_data)
-        else:
-            send_request = Api.SendDataRequest(Api.DataType.Audio,
-                                               myWindow.join_session.ownerId, _frames)
-            # print("\nAudio SendData Request:", sendReq)
+                while self.running:
+                    if self.connect_flag is True:
+                        if self.join_flag is True:
+                            _frames = self.mic_stream.read(SPK_CHUNK, exception_on_overflow = False)
 
-            res = Api.SendData(send_request)
-            # print("\nSendData Response:", res)
+                            if global_comm_grm_type is True:
+                                bin_data = self.grm_packet.to_bin_audio_data(_frames)
+                                self.send_grm_queue.put(bin_data)
+                            else:
+                                send_request = Api.SendDataRequest(Api.DataType.Audio,
+                                                                   myWindow.join_session.ownerId, _frames)
+                                # print("\nAudio SendData Request:", sendReq)
 
-            if res.code is Api.ResponseCode.Success:
-                print("\nAudio SendData success.")
-            else:
-                print("\nAudio SendData fail.", res.code)
+                                res = Api.SendData(send_request)
+                                # print("\nSendData Response:", res)
 
-    mic_stream.stop_stream()
-    mic_stream.close()
-    mic_interface.terminate()
-    QApplication.processEvents()
-
-
-def speaker_process_worker(recv_audio_queue, speaker_index):
-    grm_packet = BINWrapper()
-
-    speaker_interface = pyaudio.PyAudio()
-    print(f"Speaker Open, Index:{speaker_index}")
-    speaker_stream = speaker_interface.open(rate=RATE, channels=CHANNELS, format=FORMAT,
-                                            frames_per_buffer=SPK_CHUNK, output=True)
-    if speaker_stream is None:
-        return
-
-    recv_audio_queue.clear()
-    print(f"Speaker End, Index:{speaker_index} speaker_stream:{speaker_stream}")
-    while speaker_stream is not None:
-        #print(f"Speaker read...................Index:{speaker_index} speaker_stream:{speaker_stream}")
-        if recv_audio_queue.length() > 0:
-            bin_data = recv_audio_queue.pop()
-            # lock_speaker_audio_queue.release()
-            if bin_data is None:
-                continue
-            _type, _value, _bin_data = grm_packet.parse_bin(bin_data)
-            # print(f"[{int(time.time()*1000)}] recv audio data.len:{len(_value)} "
-            #      f" size:[{len(self.recv_audio_queue)}]")
-            speaker_stream.write(_value)
-        else:
-            # lock_speaker_audio_queue.release()
-            time.sleep(0.01)
-    speaker_stream.stop_stream()
-    speaker_stream.close()
-    speaker_interface.terminate()
-    QApplication.processEvents()
+                                if res.code is Api.ResponseCode.Success:
+                                    print("\nAudio SendData success.")
+                                else:
+                                    print("\nAudio SendData fail.", res.code)
+                    time.sleep(0.1)
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+                self.mic_interface.terminate()
+                QApplication.processEvents()
+                time.sleep(0.1)
+            QApplication.processEvents()
+            time.sleep(0.1)
 
 
-def video_change_avatar(_predictor, new_avatar):
-    _avatar_kp = _predictor.get_frame_kp(new_avatar)
-    _kp_source = None
-    _avatar = new_avatar
-    _predictor.set_source_image(_avatar)
+class SpeakerWorker(GrmParentThread):
+    def __init__(self, p_recv_audio_queue):
+        super().__init__()
+        self.speaker_stream = None
+        self.recv_audio_queue: GRMQueue = p_recv_audio_queue
+        self.speaker_interface = 0
+        self.grm_packet = BINWrapper()
 
+    def run(self):
+        while True:
+            while self.running:
+                self.speaker_interface = pyaudio.PyAudio()
+                print(f"Speaker Open, Index:{self.device_index}")
+                self.speaker_stream = self.speaker_interface.open(rate=RATE, channels=CHANNELS, format=FORMAT,
+                                                                  frames_per_buffer=SPK_CHUNK, output=True)
+                if self.speaker_stream is None:
+                    continue
 
-def video_process_worker(recv_video_queue):
-    _width = 0
-    _height = 0
-    _cap_interface = 0
-    _video = 0
-    _sent_key_frame = False
-    _predictor = None
-    _avatar = None
-    _avatar_kp = None
-    _kp_source = None
-    _join_flag: bool = False
-    _connect_flag: bool = False
-    _cur_ava = 0
-    _find_key_frame = False
-    _grm_packet = BINWrapper()
-
-    print(f"video_process_worker.....1")
-    _predictor_args = {
-        'config_path': opt.config,
-        'checkpoint_path': opt.checkpoint,
-        'relative': opt.relative,
-        'adapt_movement_scale': opt.adapt_scale,
-        'enc_downscale': opt.enc_downscale,
-    }
-
-    print(f"video_process_worker.....2")
-    _predictor = GRMPredictor(
-        **_predictor_args
-    )
-
-    print(f"video_process_worker.....3")
-    while True:
-        print(f'queue name:{recv_video_queue.name}, size:{recv_video_queue.length()}')
-        while recv_video_queue.length() > 0:
-            _bin_data = recv_video_queue.pop()
-
-            if _bin_data is not None:
-                # print(f'data received. {len(_bin_data)}')
-                if len(_bin_data) > 0:
-                    _type, _value, _bin_data = _grm_packet.parse_bin(_bin_data)
-                    # print(f' type:{_type}, data received:{len(_value)}')
-                    if _type == 100:
-                        print(f'queue:[{recv_video_queue.length()}], '
-                              f'key_frame received. {len(_value)}')
-                        key_frame = _grm_packet.parse_key_frame(_value)
-
-                        w, h = key_frame.shape[:2]
-                        x = 0
-                        y = 0
-
-                        if w > h:
-                            x = int((w - h) / 2)
-                            w = h
-                        elif h > w:
-                            y = int((h - w) / 2)
-                            h = w
-
-                        cropped_img = key_frame[x: x + w, y: y + h]
-                        if cropped_img.ndim == 2:
-                            cropped_img = np.tile(cropped_img[..., None], [1, 1, 3])
-
-                        resize_img = resize(cropped_img, (IMAGE_SIZE, IMAGE_SIZE))
-
-                        img = resize_img[..., :3][..., ::-1]
-                        img = resize(img, (IMAGE_SIZE, IMAGE_SIZE))
-
-                        video_change_avatar(_predictor, img)
-                        _predictor.reset_frames()
-                        _find_key_frame = True
-                    elif _type == 200:
-                        if _find_key_frame:
-                            kp_norm = _grm_packet.parse_kp_norm(_value, _predictor.device)
-
-                            # time_start = current_milli_time()
-                            out = _predictor.decoding(kp_norm)
-                            # time_dec = current_milli_time()
-
-                            # print(f'### recv dec:{time_dec - time_start}')
-                            # cv2.imshow('client', out[..., ::-1])
-                            cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-                            img = out.copy()
-                            h, w, c = img.shape
-                            q_img = QtGui.QImage(img.data, w, h, w * c, QtGui.QImage.Format_RGB888)
-                            pixmap = QtGui.QPixmap.fromImage(q_img)
-                            if pixmap is not None:
-                                myWindow.main_view.setPixmap(pixmap)
-                                print(f"show image")
-                        else:
-                            print(f'not key frame received. {len(_value)}')
+                self.recv_audio_queue.clear()
+                print(f"Speaker End, Index:{self.device_index} speaker_stream:{self.speaker_stream}")
+                while self.running:
+                    # lock_speaker_audio_queue.acquire()
+                    # print(f"recv audio queue size:{self.recv_audio_queue.length()}")
+                    if self.recv_audio_queue.length() > 0:
+                        bin_data = self.recv_audio_queue.pop()
+                        if bin_data is not None:
+                            _type, _value, _bin_data = self.grm_packet.parse_bin(bin_data)
+                            self.speaker_stream.write(_value)
                     time.sleep(0.01)
-            else:
-                # print(f'data empty.')
+                self.speaker_stream.stop_stream()
+                self.speaker_stream.close()
+                self.speaker_interface.terminate()
+                QApplication.processEvents()
                 time.sleep(0.01)
+            QApplication.processEvents()
             time.sleep(0.01)
-        time.sleep(0.01)
+
+
+class VideoViewWorker(GrmParentThread):
+    def __init__(self, p_name, p_view_video_queue, view_location):
+        super().__init__()
+        self.process_name = p_name
+        self.view_location = view_location
+        self.view_video_queue: GRMQueue = p_view_video_queue
+
+    def run(self):
+        while True:
+            while self.running:
+                # print(f'[{self.process_name}] queue size:{self.view_video_queue.length()}')
+                while self.view_video_queue.length() > 0:
+                    frame = self.view_video_queue.pop()
+                    if frame is not None:
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img = frame.copy()
+                        h, w, c = img.shape
+                        q_img = QtGui.QImage(img.data, w, h, w * c, QtGui.QImage.Format_RGB888)
+                        pixmap = QtGui.QPixmap.fromImage(q_img)
+                        pixmap_resized = pixmap.scaledToWidth(self.view_location.width())
+                        if pixmap_resized is not None:
+                            self.view_location.setPixmap(pixmap)
+                time.sleep(0.01)
+
+
+class VideoRecvWorker(GrmParentThread):
+    def __init__(self, p_recv_video_queue, p_view_video_queue):
+        super().__init__()
+        # self.main_view_location = main_view
+        self.width = 0
+        self.height = 0
+        self.video = 0
+        self.recv_video_queue: GRMQueue = p_recv_video_queue
+        self.view_video_queue: GRMQueue = p_view_video_queue
+        self.predictor = None
+        self.join_flag: bool = False
+        self.connect_flag: bool = False
+        # self.lock = None
+        self.cur_ava = 0
+
+    def set_join(self, p_join_flag: bool):
+        self.join_flag = p_join_flag
+        print(f"VideoRecvWorker join:{self.join_flag}")
+
+    def set_connect(self, p_connect_flag: bool):
+        self.connect_flag = p_connect_flag
+        print(f"VideoRecvWorker connect:{self.connect_flag}")
+
+    def change_avatar(self, new_avatar):
+        self.predictor.set_source_image(new_avatar)
+
+    def run(self):
+        predictor_args = {
+            'config_path': opt.config,
+            'checkpoint_path': opt.checkpoint,
+            'relative': opt.relative,
+            'adapt_movement_scale': opt.adapt_scale,
+            'enc_downscale': opt.enc_downscale,
+        }
+
+        self.predictor = GRMPredictor(
+            **predictor_args
+        )
+
+        # if self.lock is None:
+        #    self.lock = threading.Lock()
+
+        find_key_frame = False
+        grm_packet = BINWrapper()
+
+        while True:
+            while self.running:
+                # print(f'video recv queue size:{self.recv_video_queue}')
+                while self.recv_video_queue.length() > 0:
+                    _bin_data = self.recv_video_queue.pop()
+
+                    if _bin_data is not None:
+                        # print(f'data received. {len(_bin_data)}')
+                        if len(_bin_data) > 0:
+                            _type, _value, _bin_data = grm_packet.parse_bin(_bin_data)
+                            # print(f' type:{_type}, data received:{len(_value)}')
+                            if _type == 100:
+                                print(f'queue:[{self.recv_video_queue.length()}], '
+                                      f'key_frame received. {len(_value)}, queue_size:{self.recv_video_queue.length()}')
+                                key_frame = grm_packet.parse_key_frame(_value)
+
+                                w, h = key_frame.shape[:2]
+                                x = 0
+                                y = 0
+
+                                if w > h:
+                                    x = int((w - h) / 2)
+                                    w = h
+                                elif h > w:
+                                    y = int((h - w) / 2)
+                                    h = w
+
+                                cropped_img = key_frame[x: x + w, y: y + h]
+                                if cropped_img.ndim == 2:
+                                    cropped_img = np.tile(cropped_img[..., None], [1, 1, 3])
+
+                                resize_img = resize(cropped_img, (IMAGE_SIZE, IMAGE_SIZE))
+
+                                img = resize_img[..., :3][..., ::-1]
+                                img = resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+
+                                self.change_avatar(img)
+                                self.predictor.reset_frames()
+                                find_key_frame = True
+                            elif _type == 200:
+                                # print(f"recv video queue:{self.recv_video_queue.length()}")
+                                if find_key_frame:
+                                    kp_norm = grm_packet.parse_kp_norm(_value, self.predictor.device)
+
+                                    time_start = current_milli_time()
+                                    _frame = self.predictor.decoding(kp_norm)
+                                    time_dec = current_milli_time()
+
+                                    # print(f'### recv dec:{time_dec - time_start}')
+                                    # cv2.imshow('client', out[..., ::-1])
+                                    self.view_video_queue.put(_frame)
+                                else:
+                                    print(f'not key frame received. {len(_value)}')
+                time.sleep(0.03)
+            time.sleep(0.05)
+            # print('sleep')
 
 
 class GrmCommWorker(GrmParentThread):
-    def __init__(self, p_main_windows, p_predictor, p_send_grm_queue, p_recv_video_queue, p_recv_audio_queue):
+    def __init__(self, p_send_grm_queue, p_recv_video_queue, p_recv_audio_queue,
+                 p_is_server, p_ip_address, p_port_number, p_device_type):
         super().__init__()
-        self.main_windows: MainWindowClass = p_main_windows
-        self.predictor = p_predictor
+        # self.main_windows: MainWindowClass = p_main_windows
         self.comm_bin = None
         self.bin_wrapper = None
         self.client_connected: bool = False
@@ -326,6 +373,10 @@ class GrmCommWorker(GrmParentThread):
         self.kp_source = None
         self.avatar_kp = None
         self.grm_packet = BINWrapper()
+        self.is_server = p_is_server
+        self.ip_address = p_ip_address
+        self.port_number = p_port_number
+        self.device_type = p_device_type
 
     def set_join(self, p_join_flag: bool):
         self.join_flag = p_join_flag
@@ -336,7 +387,7 @@ class GrmCommWorker(GrmParentThread):
         # self.lock.acquire()
         self.client_connected = True
         self.sent_key_frame = False
-        self.main_windows.set_connect(True)
+        set_connect(True)
         # self.lock.release()
 
     def on_client_closed(self):
@@ -345,17 +396,17 @@ class GrmCommWorker(GrmParentThread):
         self.client_connected = False
         self.sent_key_frame = False
         # self.set_join(False)
-        self.main_windows.set_connect(False)
+        # self.main_windows.set_connect(False)
         # self.lock.release()
 
     def on_client_data(self, bin_data):
         if self.client_connected is False:
             self.client_connected = True
-            self.main_windows.set_connect(True)
+            set_connect(True)
         if self.join_flag is False:
             return
-        # print('server:on_client_data')
         _type, _value, _bin_data = self.grm_packet.parse_bin(bin_data)
+        # print(f'server:on_client_data type:{_type}, data_len:{len(_value)}')
         if _type == 100:    # key frame receive
             self.recv_video_queue.put(bin_data)
         elif _type == 200:  # avatarify receive
@@ -367,91 +418,85 @@ class GrmCommWorker(GrmParentThread):
             print('server:on_client_data not found type:{_type}')
         pass
 
-    '''
-    def change_avatar(self, new_avatar):
-        self.avatar_kp = self.predictor.get_frame_kp(new_avatar)
-        self.kp_source = None
-        self.avatar = new_avatar
-        self.predictor.set_source_image(self.avatar)
-    '''
-
     def run(self):
         while True:
             if global_comm_grm_type is True:
                 if self.comm_bin is None:
                     self.comm_bin = BINComm()
                 print(
-                    f"is_server:{self.predictor.is_server}, comm_bin:{self.comm_bin}, "
+                    f"is_server:{self.is_server}, comm_bin:{self.comm_bin}, "
                     f"client_connected:{self.client_connected}")
-                if self.predictor.is_server is True:
+                if self.is_server is True:
                     if self.client_connected is False:
-                        self.comm_bin.start_server(self.predictor.listen_port, self.on_client_connected,
+                        self.comm_bin.start_server(self.port_number, self.on_client_connected,
                                                    self.on_client_closed, self.on_client_data)
-                        print(f'######## run server [{self.predictor.listen_port}]. device:{self.predictor.device}')
+                        print(f'######## run server [{self.port_number}]. device:{self.device_type}')
                 else:
                     if self.client_connected is False:
                         print(
-                            f'######## run client (connect ip:{self.predictor.server_ip}, '
-                            f'connect port:{self.predictor.server_port}). device:{self.predictor.device}')
-                        self.comm_bin.start_client(self.predictor.server_ip, self.predictor.server_port,
+                            f'######## run client (connect ip:{self.ip_address}, '
+                            f'connect port:{self.port_number}). device:{self.device_type}')
+                        self.comm_bin.start_client(self.ip_address, self.port_number,
                                                    self.on_client_connected, self.on_client_closed, self.on_client_data)
                 if self.bin_wrapper is None:
                     self.bin_wrapper = BINWrapper()
 
             print(f'GrmCommWorker running:{self.running}')
             while self.running:
-                # if self.lock is None:
-                #     self.lock = threading.Lock()
+                # print(f'GrmCommWorker queue size:{self.send_grm_queue.length()}')
+                if self.send_grm_queue.length() > 0:
+                    # print(f'GrmCommWorker pop queue size:{self.send_grm_queue.length()}')
+                    bin_data = self.send_grm_queue.pop()
+                    if bin_data is not None:
+                        if global_comm_grm_type is True:
+                            if self.join_flag is True:
+                                if self.client_connected is True:
+                                    self.comm_bin.send_bin(bin_data)
+                        else:
+                            send_request = Api.SendDataRequest(Api.DataType.FeatureBasedVideo,
+                                                               myWindow.join_session.overlayId, bin_data)
+                            print("\nSendData Request:", send_request)
 
-                while self.running:
-                    # print(f'### GrmCommWorker [{self.send_grm_queue.name}] size:[{self.send_grm_queue.length()}]')
-                    while self.send_grm_queue.length() > 0:
-                        # self.lock.acquire()
-                        bin_data = self.send_grm_queue.pop()
-                        print(f'### Sended queue_size:[{self.send_grm_queue.length()}]')
-                        # self.lock.release()
-                        if bin_data is not None:
-                            if global_comm_grm_type is True:
-                                if self.join_flag is True:
-                                    if self.client_connected is True:
-                                        self.comm_bin.send_bin(bin_data)
-                                        # print(f'### Send video data length:[{len(bin_data)}]')
+                            res = Api.SendData(send_request)
+                            # print("\nSendData Response:", res)
+
+                            if res.code is Api.ResponseCode.Success:
+                                print("\nVideo SendData success.")
                             else:
-                                send_request = Api.SendDataRequest(Api.DataType.FeatureBasedVideo,
-                                                                   myWindow.join_session.overlayId, bin_data)
-                                print("\nSendData Request:", send_request)
-
-                                res = Api.SendData(send_request)
-                                # print("\nSendData Response:", res)
-
-                                if res.code is Api.ResponseCode.Success:
-                                    print("\nVideo SendData success.")
-                                else:
-                                    print("\nVideo SendData fail.", res.code)
-                    # time.sleep(0.05)
-            # time.sleep(0.05)
+                                print("\nVideo SendData fail.", res.code)
+                time.sleep(0.01)
 
 
-class WebcamWorker(GrmParentThread):
-    video_signal_preview = QtCore.pyqtSignal(QtGui.QImage)
-
-    def __init__(self, view_location, p_send_grm_queue, p_predictor, p_camera_index):
+class VideoProcessWorker(GrmParentThread):
+    def __init__(self, p_send_grm_queue, p_process_video_queue):
         super().__init__()
-        self.view_location = view_location
         self.width = 0
         self.height = 0
-        self.sent_key_frame = None
-        self.predictor = p_predictor
+        self.sent_key_frame = False
         self.bin_wrapper = None
-        # self.lock = None
+        self.process_video_queue: GRMQueue = p_process_video_queue
         self.send_grm_queue: GRMQueue = p_send_grm_queue
         self.send_key_frame_flag: bool = False
-        self.avatar = None
-        self.kp_source = None
-        self.avatar_kp = None
         self.join_flag: bool = False
         self.connect_flag: bool = False
-        self.change_device(p_camera_index)
+        self.avatar_kp = None
+
+        predictor_args = {
+            'config_path': opt.config,
+            'checkpoint_path': opt.checkpoint,
+            'relative': opt.relative,
+            'adapt_movement_scale': opt.adapt_scale,
+            'enc_downscale': opt.enc_downscale,
+            # 'listen_port': opt.listen_port,
+            # 'is_server': opt.is_server,
+            # 'server_ip': opt.server_ip,
+            # 'server_port': opt.server_port,
+            'keyframe_period': opt.keyframe_period
+        }
+
+        self.predictor = GRMPredictor(
+            **predictor_args
+        )
 
     def set_join(self, p_join_flag: bool):
         self.join_flag = p_join_flag
@@ -461,22 +506,23 @@ class WebcamWorker(GrmParentThread):
         self.connect_flag = p_connect_flag
         print(f"WebcamWorker connect:{self.connect_flag}")
 
-    def send_key_frame(self, set_send: bool):
+    def send_key_frame(self):
+        self.send_key_frame_flag = True
         if self.join_flag is True:
             print('send key frame true.....')
-            self.send_key_frame_flag = set_send
+            self.send_key_frame_flag = True
 
     def change_avatar(self, new_avatar):
         self.avatar_kp = self.predictor.get_frame_kp(new_avatar)
-        self.kp_source = None
-        self.avatar = new_avatar
-        self.predictor.set_source_image(self.avatar)
+        avatar = new_avatar
+        self.predictor.set_source_image(avatar)
 
     def key_frame_send(self, frame_orig):
         if frame_orig is None:
             print("not Key Frame Make")
             return
 
+        '''
         if self.join_flag is False:
             print(f"Join is false and not send keyframe")
             return
@@ -484,6 +530,7 @@ class WebcamWorker(GrmParentThread):
         if self.connect_flag is False:
             print(f"connect is false and not send keyframe")
             return
+        '''
 
         b, g, r = cv2.split(frame_orig)  # img 파일을 b,g,r로 분리
         frame = cv2.merge([r, g, b])  # b, r을 바꿔서 Merge
@@ -492,11 +539,11 @@ class WebcamWorker(GrmParentThread):
 
         bin_data = self.bin_wrapper.to_bin_key_frame(key_frame[1])
 
-        # self.lock.acquire()
+        self.process_video_queue.clear()
+        self.send_grm_queue.clear()
         self.send_grm_queue.put(bin_data)
         print(f'######## send_key_frame. len:[{len(bin_data)}], resolution:{frame.shape[0]} x {frame.shape[1]} '
               f'size:{len(bin_data)}')
-        # self.lock.release()
         self.predictor.reset_frames()
 
         # change avatar
@@ -521,22 +568,66 @@ class WebcamWorker(GrmParentThread):
         img = resize(img, (IMAGE_SIZE, IMAGE_SIZE))
 
         self.change_avatar(img)
+        self.sent_key_frame = True
+
+    def run(self):
+        frame_proportion = 0.9
+        frame_offset_x = 0
+        frame_offset_y = 0
+        while True:
+            self.sent_key_frame = False
+            if self.bin_wrapper is None:
+                self.bin_wrapper = BINWrapper()
+            while self.running:
+                # print(f"recv video queue read .....")
+                while self.process_video_queue.length() > 0:
+                    # print(f"recv video data .....")
+                    frame = self.process_video_queue.pop()
+                    if frame is None:
+                        time.sleep(0.01)
+                        continue
+
+                    frame = frame[..., ::-1]
+                    frame_orig = frame.copy()
+                    frame, (frame_offset_x, frame_offset_y) = crop(frame, p=frame_proportion, offset_x=frame_offset_x,
+                                                                   offset_y=frame_offset_y)
+                    frame = resize(frame, (IMAGE_SIZE, IMAGE_SIZE))[..., :3]
+                    bin_data = None
+                    if self.sent_key_frame is True:
+                        kp_norm = self.predictor.encoding(frame)
+                        bin_data = self.bin_wrapper.to_bin_kp_norm(kp_norm)
+
+                    if bin_data is not None:
+                        # print(f' send_grm_queue size:[{self.send_grm_queue.length()}]')
+                        self.send_grm_queue.put(bin_data)
+
+                    if self.send_key_frame_flag is True:
+                        self.key_frame_send(frame_orig)
+                        self.send_key_frame_flag = False
+                    else:
+                        time.sleep(0.01)
+                time.sleep(0.01)
+            time.sleep(0.01)
+
+
+class WebcamWorker(GrmParentThread):
+    def __init__(self, p_camera_index, p_process_video_queue, p_preview_video_queue):
+        super().__init__()
+        # self.view_location = view_location
+        # self.sent_key_frame = None
+        # self.bin_wrapper = None
+        # self.lock = None
+        self.process_video_queue: GRMQueue = p_process_video_queue
+        self.preview_video_queue: GRMQueue = p_preview_video_queue
+        # self.send_key_frame_flag: bool = False
+        # self.join_flag: bool = False
+        # self.connect_flag: bool = False
+        self.change_device(p_camera_index)
 
     def run(self):
         while True:
             while self.running:
-                # if self.lock is None:
-                #     self.lock = threading.Lock()
-
-                if self.bin_wrapper is None:
-                    self.bin_wrapper = BINWrapper()
-
-                self.sent_key_frame = False
-
                 camera_index = self.device_index
-
-                if self.predictor.is_server is False:
-                    camera_index = 2
 
                 if camera_index is None:
                     print(f'camera index invalid...[{camera_index}]')
@@ -546,12 +637,14 @@ class WebcamWorker(GrmParentThread):
                     print(f"Camera index invalid...{camera_index}")
                     return
 
-                print(f"video capture async [{camera_index}]")
                 time.sleep(1)
+                print(f"video capture async [{camera_index}]")
                 cap = VideoCaptureAsync(camera_index)
-                time.sleep(4)
+                print(f"video capture async end [{camera_index}]")
+                time.sleep(1)
                 cap.start()
 
+                self.process_video_queue.clear()
                 frame_proportion = 0.9
                 frame_offset_x = 0
                 frame_offset_y = 0
@@ -560,53 +653,27 @@ class WebcamWorker(GrmParentThread):
                     if not cap.isOpened():
                         time.sleep(0.05)
                         continue
+
                     ret, frame = cap.read()
                     if not ret:
                         print(f"Can't receive frame (stream end?). Exiting ...")
                         time.sleep(1)
                         break
 
+                    self.process_video_queue.put(frame)
+
                     frame = frame[..., ::-1]
-                    frame_orig = frame.copy()
                     frame, (frame_offset_x, frame_offset_y) = crop(frame, p=frame_proportion, offset_x=frame_offset_x,
                                                                    offset_y=frame_offset_y)
                     frame = resize(frame, (IMAGE_SIZE, IMAGE_SIZE))[..., :3]
 
-                    if self.avatar is None:
-                        self.change_avatar(frame)
-
-                    # time_start = current_milli_time()
-                    kp_norm = self.predictor.encoding(frame)
-                    # time_kp_norm = current_milli_time()
-
-                    bin_data = self.bin_wrapper.to_bin_kp_norm(kp_norm)
-                    # print(f' encoding time:[{time_kp_norm- time_start}]')
-
-                    if self.join_flag is True:
-                        # self.lock.acquire()
-                        self.send_grm_queue.put(bin_data)
-                        # self.lock.release()
-
-                        if self.send_key_frame_flag is True:
-                            self.key_frame_send(frame_orig)
-                            self.send_key_frame_flag = False
-                    else:
-                        time.sleep(0.01)
-
                     preview_frame = frame.copy()
 
                     draw_rect(preview_frame)
-                    cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
-                    img = preview_frame.copy()
-                    h, w, c = img.shape
-                    q_img = QtGui.QImage(img.data, w, h, w*c, QtGui.QImage.Format_RGB888)
-                    pixmap = QtGui.QPixmap.fromImage(q_img)
-                    pixmap_resized = pixmap.scaledToWidth(self.view_location.width())
-                    if pixmap_resized is not None:
-                        self.view_location.setPixmap(pixmap_resized)
 
-                    time.sleep(0.01)
-                time.sleep(0.01)
+                    # print(f"preview put.....")
+                    self.preview_video_queue.put(preview_frame)
+                    time.sleep(0.03)
 
                 print('# video interface release index = [', self.device_index, ']')
                 cap.stop()
@@ -620,12 +687,8 @@ class MainWindowClass(QMainWindow, form_class):
         self.join_session: SessionData = SessionData()
         self.join_peer: List[PeerData] = []
 
-        self.camera_device_init(4)
+        self.camera_device_init(5)
         self.audio_device_init()
-
-        self.recv_audio_queue = GRMQueue("recv_audio")
-        self.recv_video_queue = GRMQueue("recv_video")
-        self.send_grm_queue = GRMQueue("send_grm")
 
         predictor_args = {
             'config_path': opt.config,
@@ -660,23 +723,7 @@ class MainWindowClass(QMainWindow, form_class):
         self.comboBox_audio_device.currentIndexChanged.connect(self.change_audio_device)
         self.comboBox_video_device.currentIndexChanged.connect(self.change_camera_device)
 
-        # self.worker_video_recv = VideoRecvWorker(self.recv_video_queue, self.main_view)
-        # self.worker_video_recv.start_process()
-
-        self.work_grm_comm = GrmCommWorker(self, self.predictor, self.send_grm_queue, self.recv_video_queue,
-                                           self.recv_audio_queue)
-        self.work_grm_comm.start_process()
-
-        self.worker_webcam = WebcamWorker(self.preview, self.send_grm_queue, self.predictor,
-                                          self.comboBox_video_device.currentIndex())
-        self.button_send_keyframe.clicked.connect(self.worker_webcam.send_key_frame)
-        self.worker_webcam.start_process()
-
-        # self.worker_mic = MicWorker(self.send_grm_queue)
-        # time.sleep(5)
-
-        # self.worker_speaker = SpeakerWorker(self.recv_audio_queue)
-
+        # self.button_send_keyframe.clicked.connect(self.worker_video.send_key_frame)
         self.button_chat_send.setDisabled(True)
         self.lineEdit_input_chat.setDisabled(True)
         self.peer_id = ""
@@ -684,63 +731,9 @@ class MainWindowClass(QMainWindow, form_class):
         self.timer.start(self.keyframe_period)
         self.timer.timeout.connect(self.timeout)
 
-        self.worker_mic_process = None
-        self.worker_speaker_process = None
-        self.worker_video_process = None
-
-    def video_process_start(self):
-        self.worker_video_process = multiprocessing.Process(target=video_process_worker,
-                                                            args=(self.recv_video_queue, ))
-        self.worker_video_process.start()
-
-    def video_process_stop(self):
-        if self.worker_video_process is not None:
-            self.worker_video_process.terminate()
-
-    def mic_process_start(self):
-        self.worker_mic_process = multiprocessing.Process(target=mic_process_worker,
-                                                          args=(self.send_grm_queue, self.comboBox_mic.currentData(),
-                                                                global_comm_grm_type, ))
-        self.worker_mic_process.start()
-
-    def mic_process_stop(self):
-        if self.worker_mic_process is not None:
-            self.worker_mic_process.terminate()
-
-    def speaker_process_start(self):
-        self.worker_speaker_process = multiprocessing.Process(target=speaker_process_worker,
-                                                              args=(self.recv_audio_queue,
-                                                                    self.comboBox_audio_device.currentData(), ))
-        self.worker_speaker_process.start()
-
-    def speaker_process_stop(self):
-        if self.worker_speaker_process is not None:
-            self.worker_speaker_process.terminate()
-
-    def set_join(self, join_flag: bool):
-        # self.worker_video_recv.set_join(join_flag)
-        self.worker_webcam.set_join(join_flag)
-        self.work_grm_comm.set_join(join_flag)
-
-    def set_connect(self, connect_flag: bool):
-        # self.worker_video_recv.set_connect(connect_flag)
-        self.worker_webcam.set_connect(connect_flag)
-
     def timeout(self):
-        self.worker_webcam.send_key_frame(True)
-
-    def start(self):
-        self.worker_webcam.start_process()
-        time.sleep(0.5)
-        self.video_process_start()
-        self.mic_process_start()
-        self.speaker_process_start()
-
-    def stop(self):
-        self.worker_webcam.pause_process()
-        self.speaker_process_stop()
-        self.mic_process_stop()
-        self.video_process_stop()
+        global worker_video
+        worker_video.send_key_frame()
 
     def create_room(self):
         if self.create_button.text() == "생성":
@@ -796,23 +789,29 @@ class MainWindowClass(QMainWindow, form_class):
             self.leave_room()
 
     def change_camera_device(self):
+        global worker_webcam
         print('camera index change start')
-        self.worker_webcam.pause_process()
+        worker_webcam.pause_process()
         time.sleep(1)
-        self.worker_webcam.change_device(self.comboBox_video_device.currentData())
-        self.worker_webcam.resume_process()
+        worker_webcam.change_device(self.comboBox_video_device.currentData())
+        worker_webcam.resume_process()
         print('camera index change end')
 
     def change_mic_device(self):
-        self.mic_process_stop()
+        global worker_mic
+        worker_mic.pause_process()
         time.sleep(2)
-        self.mic_process_start()
+        worker_mic.change_device(self.comboBox_mic.currentData())
+        # self.worker_mic.change_device(1)
+        worker_mic.resume_process()
 
     def change_audio_device(self):
+        global worker_speaker
         print('main change speaker device start')
-        self.speaker_process_stop()
+        worker_speaker.pause_process()
         time.sleep(2)
-        self.speaker_process_start()
+        worker_speaker.change_device(self.comboBox_audio_device.currentData())
+        worker_speaker.resume_process()
         print('main change speaker device end')
 
     def send_join_room_func(self):
@@ -837,7 +836,7 @@ class MainWindowClass(QMainWindow, form_class):
             print("\nJoinResponse:", join_response)
 
             if join_response.code is Api.ResponseCode.Success:
-                myWindow.set_join(True)
+                set_join(True)
                 self.peer_id = peer_id
             return join_response
         elif myWindow.join_button.text() == "퇴장":
@@ -915,7 +914,7 @@ class MainWindowClass(QMainWindow, form_class):
                                          accessKey=self.join_session.accessKey))
         if res.code is Api.ResponseCode.Success:
             print("\nLeave success.")
-            self.set_join(False)
+            set_join(False)
 
             self.join_button.setText("입장")
             self.create_button.setDisabled(False)
@@ -1054,16 +1053,22 @@ class MainWindowClass(QMainWindow, form_class):
             self.listWidget.addItem(i.display_name)
 
     def exit_button(self):
-        self.worker_webcam.pause_process()
-        self.speaker_process_stop()
-        self.mic_process_stop()
-        self.video_process_stop()
-        time.sleep(1)
         self.close()
 
     def camera_device_init(self, max_count):
+        pygame.camera.init()
+        # make the list of all available cameras
+        cam_list = pygame.camera.list_cameras()
+        print(f"camlist:{cam_list}")
+        for index in cam_list:
+            device_string = "Camera #" + str(index)
+            self.comboBox_video_device.addItem(device_string, userData=index)
+
+        '''
         for camera_index in range(0, max_count):
-            _cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            #_cap = VideoCaptureAsync(camera_index)
+            #_cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            #_cap = cv2.VideoCapture(camera_index)
             device_string = "Camera #" + str(camera_index)
             if not _cap.isOpened():
                 log_string = device_string + " Open failed"
@@ -1073,7 +1078,7 @@ class MainWindowClass(QMainWindow, form_class):
                 self.comboBox_video_device.addItem(device_string, userData=camera_index)
                 log_string = device_string + " Open Success"
                 print(log_string)
-            _cap.release()
+            '''
 
     def audio_device_init(self):
         pa = pyaudio.PyAudio()
@@ -1175,6 +1180,128 @@ class RoomInformationClass(QDialog):
         self.close()
 
 
+def all_start_worker():
+    global worker_video_recv
+    global worker_video_view
+    global worker_video
+    global worker_webcam
+    global worker_video_preview
+    global worker_mic
+    global worker_speaker
+    global worker_grm_comm
+
+    if worker_video_recv is not None:
+        worker_video_recv.start_process()
+    else:
+        worker_video_recv = VideoRecvWorker(recv_video_queue, main_view_video_queue)
+
+    if worker_video_view is not None:
+        worker_video_view.start_process()
+    else:
+        worker_video_view = VideoViewWorker("main_view", main_view_video_queue, myWindow.main_view)
+
+    if worker_video is not None:
+        worker_video.start_process()
+    else:
+        worker_video = VideoProcessWorker(send_grm_queue, process_video_queue)
+
+    if worker_webcam is not None:
+        worker_webcam.start_process()
+    else:
+        worker_webcam = WebcamWorker(myWindow.comboBox_video_device.currentIndex(),
+                                     process_video_queue, preview_video_queue)
+
+    if worker_video_preview is not None:
+        worker_video_preview.start_process()
+    else:
+        worker_video_preview = VideoViewWorker("preview", preview_video_queue, myWindow.preview)
+
+    if worker_mic is not None:
+        worker_mic.start_process()
+    else:
+        worker_mic = MicWorker(send_grm_queue)
+
+    if worker_speaker is not None:
+        worker_speaker.start_process()
+    else:
+        worker_speaker = SpeakerWorker(recv_audio_queue)
+
+    if worker_grm_comm is not None:
+        worker_grm_comm.start_process()
+    else:
+        worker_grm_comm = GrmCommWorker(send_grm_queue, recv_video_queue, recv_audio_queue)
+
+
+def all_stop_worker():
+    global worker_speaker
+    global worker_video_recv
+    global worker_video
+    global worker_webcam
+    global worker_video_preview
+    global worker_mic
+    global worker_speaker
+    global worker_grm_comm
+
+    if worker_video_recv is not None:
+        worker_video_recv.pause_process()
+    if worker_video_view is not None:
+        worker_video_view.pause_process()
+    if worker_video is not None:
+        worker_video.pause_process()
+    if worker_webcam is not None:
+        worker_webcam.pause_process()
+    if worker_video_preview is not None:
+        worker_video_preview.pause_process()
+    if worker_mic is not None:
+        worker_mic.pause_process()
+    if worker_speaker is not None:
+        worker_speaker.pause_process()
+    if worker_grm_comm is not None:
+        worker_grm_comm.pause_process()
+
+
+def set_join(join_flag: bool):
+    global worker_speaker
+    global worker_video_recv
+    global worker_video
+    global worker_webcam
+    global worker_video_preview
+    global worker_mic
+    global worker_speaker
+    global worker_grm_comm
+
+    worker_video_recv.set_join(join_flag)
+    worker_video.set_join(join_flag)
+    worker_grm_comm.set_join(join_flag)
+    worker_mic.set_join(join_flag)
+
+
+def set_connect(connect_flag: bool):
+    worker_video_recv.set_connect(connect_flag)
+    # self.worker_webcam.set_connect(connect_flag)
+    worker_video.set_connect(connect_flag)
+    worker_mic.set_connect(connect_flag)
+
+
+def get_predictor():
+    _predictor_args = {
+        'config_path': opt.config,
+        'checkpoint_path': opt.checkpoint,
+        'relative': opt.relative,
+        'adapt_movement_scale': opt.adapt_scale,
+        'enc_downscale': opt.enc_downscale,
+        'listen_port': opt.listen_port,
+        'is_server': opt.is_server,
+        'server_ip': opt.server_ip,
+        'server_port': opt.server_port,
+        'keyframe_period': opt.keyframe_period
+    }
+    _predictor = GRMPredictor(
+        **_predictor_args
+    )
+    return _predictor
+
+
 if __name__ == '__main__':
     # import os
     # os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -1183,7 +1310,21 @@ if __name__ == '__main__':
     print("START.....MAIN WINDOWS")
     print(f'cuda is {torch.cuda.is_available()}')
 
-    global_comm_grm_type = True
+    predictor = get_predictor()
+    port_number = 0
+    ip_address = ""
+    if predictor.is_server is True:
+        port_number = predictor.listen_port
+    else:
+        ip_address = predictor.server_ip
+        port_number = predictor.server_port
+
+    recv_audio_queue = GRMQueue("recv_audio", False)
+    recv_video_queue = GRMQueue("recv_video", False)
+    main_view_video_queue = GRMQueue("main_view_video", False)
+    preview_video_queue = GRMQueue("preview_video", False)
+    send_grm_queue = GRMQueue("send_grm", False)
+    process_video_queue = GRMQueue("process_video", False)
 
     # lock_mic_audio_queue = threading.Lock()
     # lock_speaker_audio_queue = threading.Lock()
@@ -1193,9 +1334,21 @@ if __name__ == '__main__':
     join_ui = RoomJoinClass()
     room_information_ui = RoomInformationClass()
 
+    worker_video_recv = VideoRecvWorker(recv_video_queue, main_view_video_queue)
+    worker_video_view = VideoViewWorker("main_view", main_view_video_queue, myWindow.main_view)
+    worker_video = VideoProcessWorker(send_grm_queue, process_video_queue)
+    worker_webcam = WebcamWorker(myWindow.comboBox_video_device.currentIndex(),
+                                 process_video_queue, preview_video_queue)
+    worker_video_preview = VideoViewWorker("preview", preview_video_queue, myWindow.preview)
+    worker_mic = MicWorker(send_grm_queue)
+    worker_speaker = SpeakerWorker(recv_audio_queue)
+    worker_grm_comm = GrmCommWorker(send_grm_queue, recv_video_queue, recv_audio_queue,
+                                    predictor.is_server, ip_address, port_number, predictor.device)
+
     myWindow.room_information_button.setDisabled(True)
-    myWindow.start()
     myWindow.show()
+
+    all_start_worker()
 
     sys.exit(app.exec_())
 
